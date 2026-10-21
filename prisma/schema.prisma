@@ -1,0 +1,459 @@
+// OSINT.AI verification, Rules-of-Engagement, and scan-gating data model.
+//
+// Design summary (see docs/KYC_DOMAIN_VERIFICATION.md for the full writeup):
+//  - Identity verification (KYC/LightAttestation) proves "this is a real,
+//    accountable adult." It never by itself authorizes a scan.
+//  - Domain verification (Domain) proves "this person controls this domain."
+//  - AuthorizationLetter binds a verified identity to a verified domain.
+//  - RulesOfEngagement (RoE) narrows that further: it's the only thing that
+//    can turn on social-engineering targets, brute-force targets, or active
+//    exploitation for an engagement, and names exactly who/what is in scope.
+//  - admin_test on User is the sole switch for dry-run mode on automated
+//    tools; ScanJob.isDryRun is set from it at dispatch time.
+//  - Exploitation, brute-forcing, and social engineering are NOT executed by
+//    this backend. They're run manually by the operator and logged back in
+//    through a gated API (see ManualActionLog / ExploitSession below) — this
+//    platform tracks and evidences those engagements, it doesn't run them.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+
+// FULL: photo-ID + liveness selfie match via a KYC vendor (Persona / Stripe
+//       Identity / Onfido). Required for recurring "monitoring" engagements
+//       and for anything touching exploitation/brute-force/social engineering.
+// LIGHT: self-attested adult + verified payment method. Standard B2B minimum,
+//        acceptable only for one-off, recon-only engagements.
+enum KycTier {
+  LIGHT
+  FULL
+}
+
+enum KycStatus {
+  NOT_STARTED
+  PENDING
+  VERIFIED
+  REJECTED
+  EXPIRED
+}
+
+enum KycVendor {
+  PERSONA
+  STRIPE_IDENTITY
+  ONFIDO
+}
+
+enum EngagementType {
+  ONE_OFF
+  MONITORING
+}
+
+enum DomainVerificationMethod {
+  DNS_TXT
+  EMAIL_WHOIS_ADMIN
+}
+
+enum DomainVerificationStatus {
+  PENDING
+  VERIFIED
+  FAILED
+  EXPIRED
+  REVOKED
+}
+
+enum AuthorizationLetterStatus {
+  DRAFT
+  SIGNED
+  VOIDED
+}
+
+enum EsignProvider {
+  INTERNAL_TYPED_SIGNATURE
+  HELLOSIGN
+  DOCUSIGN
+}
+
+enum ScanStatus {
+  QUEUED
+  DRY_RUN
+  RUNNING
+  COMPLETED
+  FAILED
+  BLOCKED
+}
+
+enum AgentWorkflow {
+  DOMAIN_RECON // spiderfoot + shodan + nmap/nikto/gobuster: recon only, fully automated
+}
+
+enum AgentRunStatus {
+  QUEUED
+  RUNNING
+  COMPLETED
+  FAILED
+  BLOCKED
+}
+
+enum RulesOfEngagementStatus {
+  DRAFT
+  SIGNED
+  EXPIRED
+  REVOKED
+}
+
+enum WorkspaceStatus {
+  PROVISIONING
+  RUNNING
+  STOPPED
+  FAILED
+}
+
+enum ManualActionCategory {
+  EXPLOITATION
+  BRUTE_FORCE
+  SOCIAL_ENGINEERING
+}
+
+model User {
+  id           String @id @default(cuid())
+  email        String @unique
+  passwordHash String
+  role         Role   @default(USER)
+
+  // The admin-bypass mechanism for AUTOMATED tools only (recon). When true,
+  // every automated scan this user triggers routes to the mock dispatcher
+  // instead of the real job queue. See services/scan/dispatcher.ts.
+  adminTest Boolean @default(false)
+
+  kycTier              KycTier?
+  kycStatus            KycStatus @default(NOT_STARTED)
+  kycVendor            KycVendor?
+  kycVendorReferenceId String?
+  kycVerificationToken String? @unique
+  kycVerifiedAt        DateTime?
+
+  lightAttestation LightAttestation?
+
+  domains               Domain[]
+  authorizationLetters  AuthorizationLetter[]
+  rulesOfEngagement     RulesOfEngagement[]
+  scanJobs              ScanJob[]
+  agentRuns             AgentRun[]
+  exploitSessions       ExploitSession[]
+  manualActionLogs      ManualActionLog[]
+  auditLogs             AuditLog[]
+  kycVerificationEvents KycVerificationEvent[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([kycStatus])
+}
+
+model LightAttestation {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  attestedAdult  Boolean   @default(false)
+  attestedAt     DateTime?
+  attestationIp  String?
+
+  paymentMethodProvider   String?
+  paymentMethodToken      String?
+  paymentMethodVerifiedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model KycVerificationEvent {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  vendor          KycVendor
+  vendorSessionId String
+  status          KycStatus
+  signatureValid  Boolean
+  rawPayload      Json
+  receivedAt      DateTime @default(now())
+
+  @@index([userId])
+  @@index([vendorSessionId])
+}
+
+model Domain {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  domainName     String
+  engagementType EngagementType @default(ONE_OFF)
+
+  verificationMethod DomainVerificationMethod @default(DNS_TXT)
+  verificationStatus DomainVerificationStatus @default(PENDING)
+
+  dnsRecordHost  String?
+  dnsRecordValue String?
+
+  adminContactEmail    String?
+  emailChallengeToken  String?
+  emailChallengeSentAt DateTime?
+  emailChallengeExpiry DateTime?
+
+  verifiedAt    DateTime?
+  lastCheckedAt DateTime?
+  failureReason String?
+
+  authorizationLetters AuthorizationLetter[]
+  rulesOfEngagement    RulesOfEngagement[]
+  scanJobs             ScanJob[]
+  agentRuns            AgentRun[]
+  workspace            EngagementWorkspace?
+  manualActionLogs     ManualActionLog[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, domainName])
+  @@index([verificationStatus])
+}
+
+model AuthorizationLetter {
+  id       String @id @default(cuid())
+  userId   String
+  user     User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  domainId String
+  domain   Domain @relation(fields: [domainId], references: [id], onDelete: Cascade)
+
+  status AuthorizationLetterStatus @default(DRAFT)
+
+  esignProvider   EsignProvider @default(INTERNAL_TYPED_SIGNATURE)
+  esignEnvelopeId String?
+
+  signerName      String
+  signerTitle     String?
+  typedSignature  String?
+  consentChecked  Boolean @default(false)
+  signerIp        String?
+  signerUserAgent String?
+
+  kycVerificationTokenAtSigning String?
+  kycTierAtSigning               KycTier?
+
+  pdfStoragePath String?
+  pdfSha256      String?
+  signedAt       DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  scanJobs ScanJob[]
+
+  @@index([userId, domainId])
+}
+
+// The client's own signed scope for who can be socially engineered, what
+// can be brute-forced, and whether active exploitation is authorized at
+// all — separate from, and narrower than, the AuthorizationLetter.
+model RulesOfEngagement {
+  id       String @id @default(cuid())
+  userId   String
+  user     User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  domainId String
+  domain   Domain @relation(fields: [domainId], references: [id], onDelete: Cascade)
+
+  authorizationLetterId String
+
+  status RulesOfEngagementStatus @default(DRAFT)
+
+  socialEngineeringAllowed Boolean @default(false)
+  socialEngineeringTargets Json? // [{ name, email, role? }] — the only people who may be targeted
+
+  bruteForceAllowed Boolean @default(false)
+  bruteForceTargets Json? // [{ service, host, port }] — the only targets hydra/etc. may be run against
+
+  exploitationAllowed Boolean @default(false)
+
+  allowedIpRanges    String?
+  prohibitedActions  String?
+  testingWindowStart DateTime?
+  testingWindowEnd   DateTime?
+  expiresAt          DateTime?
+
+  signerName      String
+  signerTitle     String?
+  typedSignature  String?
+  consentChecked  Boolean @default(false)
+  signerIp        String?
+  signerUserAgent String?
+
+  kycVerificationTokenAtSigning String?
+  kycTierAtSigning               KycTier?
+
+  pdfStoragePath String?
+  pdfSha256      String?
+  signedAt       DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  manualActionLogs ManualActionLog[]
+
+  @@index([userId, domainId])
+}
+
+model ScanJob {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  domainId String
+  domain   Domain @relation(fields: [domainId], references: [id])
+
+  authorizationLetterId String
+  authorizationLetter   AuthorizationLetter @relation(fields: [authorizationLetterId], references: [id])
+
+  agentRunId String?
+  agentRun   AgentRun? @relation(fields: [agentRunId], references: [id])
+
+  tool   String // "spiderfoot" | "shodan" | "hash_audit" | "metasploit_recon" | "nmap" | "nikto" | "gobuster"
+  status ScanStatus @default(QUEUED)
+  params Json?
+
+  isDryRun Boolean @default(false)
+
+  requestedAt  DateTime  @default(now())
+  dispatchedAt DateTime?
+  completedAt  DateTime?
+  resultRef    String?
+  errorMessage String?
+
+  @@index([userId])
+  @@index([domainId])
+  @@index([status])
+  @@index([agentRunId])
+}
+
+model AgentRun {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  domainId String
+  domain   Domain @relation(fields: [domainId], references: [id])
+
+  authorizationLetterId String
+
+  workflow AgentWorkflow
+  status   AgentRunStatus @default(QUEUED)
+  isDryRun Boolean        @default(false)
+
+  scanJobs ScanJob[]
+
+  createdAt   DateTime  @default(now())
+  completedAt DateTime?
+
+  @@index([userId])
+  @@index([domainId])
+}
+
+// A per-engagement, disposable Kali container that recon tools run inside
+// via `docker exec`, and that the operator can also shell into directly
+// (outside this API) to run hydra/msfconsole/msfvenom/SET themselves.
+model EngagementWorkspace {
+  id       String @id @default(cuid())
+  userId   String
+  domainId String @unique
+  domain   Domain @relation(fields: [domainId], references: [id], onDelete: Cascade)
+
+  containerName  String          @unique
+  status         WorkspaceStatus @default(PROVISIONING)
+  installedTools Json            @default("[]")
+
+  createdAt DateTime  @default(now())
+  stoppedAt DateTime?
+
+  @@index([userId])
+}
+
+// One row per Metasploit/manual session the operator reports having opened
+// — "how far did we get," entered by the operator after running the tool
+// themselves, not created automatically by this backend.
+model ExploitSession {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  domainId String
+
+  sessionType  String // "shell", "meterpreter", etc., as reported by the operator
+  targetHost   String
+  viaTool      String?
+  notes        String?
+
+  openedAt     DateTime  @default(now())
+  lastActivity DateTime  @default(now())
+  closedAt     DateTime?
+
+  @@index([userId])
+  @@index([domainId])
+}
+
+// The evidence trail for everything run OUTSIDE this backend: hydra,
+// msfconsole/msfvenom, SET/Gophish, manual exploitation. Gated on the same
+// signed RoE capability as the equivalent automated tool would be, so the
+// record can't be created for scope that was never authorized — but
+// nothing here executes anything. It's a report-back form.
+model ManualActionLog {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  domainId String
+  domain   Domain @relation(fields: [domainId], references: [id], onDelete: Cascade)
+
+  rulesOfEngagementId String
+  rulesOfEngagement   RulesOfEngagement @relation(fields: [rulesOfEngagementId], references: [id])
+
+  category ManualActionCategory
+  tool     String // e.g. "hydra", "metasploit", "msfvenom", "gophish", "set"
+  command  String? // what was actually run, for the record
+  summary  String // what happened, in the operator's own words
+  resultRef String? // optional pointer to a fuller log/output file
+
+  targetHost String?
+  sessionId  String? // links to ExploitSession.id if this opened/used a session
+
+  performedAt DateTime @default(now())
+  createdAt   DateTime @default(now())
+
+  @@index([userId])
+  @@index([domainId])
+}
+
+model AuditLog {
+  id     String  @id @default(cuid())
+  userId String?
+  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  eventType String
+  metadata  Json
+  ip        String?
+
+  createdAt DateTime @default(now())
+
+  @@index([eventType])
+  @@index([userId])
+}
